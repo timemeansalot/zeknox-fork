@@ -348,7 +348,7 @@ TEST(LIBCUDA, poseidon_merkle_bench)
     const u64 leaf_size = 135;
     const u64 cap_height = 2;
     const int runs = 5;
-    const u64 sizes[] = {8192, 16384, 32768};
+    const u64 sizes[] = {8192, 16384, 32768, 65536, 131072};
     const char *baseline_path = std::getenv("CPU_BASELINE_FILE");
     if (baseline_path == nullptr)
     {
