@@ -291,7 +291,7 @@ static void bench_poseidon_merkle_cuda_vs_cpu(
     }
     gpu_ms /= runs;
 
-    printf("Poseidon Merkle (leaves=%lu, leaf_size=%lu, cap_h=%lu) CPU %.3f ms | GPU %.3f ms | speedup %.2fx%s\\n",
+    printf("Poseidon Merkle (leaves=%lu, leaf_size=%lu, cap_h=%lu) CPU %.3f ms | GPU %.3f ms | speedup %.2fx%s\n",
            leaves_count, leaf_size, cap_height, cpu_ms, gpu_ms, cpu_ms / gpu_ms,
            have_baseline ? " (CPU baseline)" : "");
 
