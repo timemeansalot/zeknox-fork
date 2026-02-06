@@ -4,6 +4,15 @@
 
 #include <gtest/gtest.h>
 #include <math.h>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <chrono>
+#include <vector>
 
 #include <keccak/keccak.hpp>
 #include <monolith/monolith.hpp>
@@ -157,6 +166,141 @@ __global__ void poseidonbn128_hash(u64 *in, u64 *out, u32 n)
 
     PoseidonBN128Hasher::gpu_hash_one((gl64_t *)in, n, (gl64_t *)out);
 }
+
+static std::unordered_map<u64, double> load_cpu_baseline(const char *path)
+{
+    std::unordered_map<u64, double> out;
+    if (!path)
+        return out;
+
+    std::ifstream in(path);
+    if (!in.is_open())
+        return out;
+
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.empty() || line[0] == '#')
+            continue;
+        std::istringstream iss(line);
+        u64 leaves = 0;
+        double ms = 0.0;
+        if (iss >> leaves >> ms)
+        {
+            out[leaves] = ms;
+        }
+    }
+    return out;
+}
+
+static void bench_poseidon_merkle_cuda_vs_cpu(
+    u64 leaves_count,
+    u64 leaf_size,
+    u64 cap_height,
+    int runs,
+    const std::unordered_map<u64, double> &cpu_baseline)
+{
+    const u64 digests_count = 2 * (leaves_count - (1ull << cap_height));
+    const u64 caps_count = 1ull << cap_height;
+    const u64 hash_type = HashPoseidon;
+
+    std::vector<u64> leaves(leaves_count * leaf_size);
+    for (u64 i = 0; i < leaves.size(); i++)
+    {
+        leaves[i] = i;
+    }
+
+    double cpu_ms = 0.0;
+    bool have_baseline = false;
+    auto it = cpu_baseline.find(leaves_count);
+    if (it != cpu_baseline.end())
+    {
+        cpu_ms = it->second;
+        have_baseline = true;
+    }
+    else
+    {
+        std::vector<u64> digests_cpu(digests_count * HASH_SIZE_U64);
+        std::vector<u64> caps_cpu(caps_count * HASH_SIZE_U64);
+        double total_ms = 0.0;
+        for (int r = 0; r < runs; r++)
+        {
+            auto start = std::chrono::high_resolution_clock::now();
+            fill_digests_buf_linear_cpu(
+                digests_cpu.data(),
+                caps_cpu.data(),
+                leaves.data(),
+                digests_count,
+                caps_count,
+                leaves_count,
+                leaf_size,
+                cap_height,
+                hash_type);
+            auto end = std::chrono::high_resolution_clock::now();
+            total_ms += std::chrono::duration<double, std::milli>(end - start).count();
+        }
+        cpu_ms = total_ms / runs;
+    }
+
+    // GPU timing (kernel only; leaves copied once)
+    u64 *d_leaves = nullptr;
+    u64 *d_digests = nullptr;
+    u64 *d_caps = nullptr;
+    CHECKCUDAERR(cudaMalloc(&d_leaves, leaves.size() * sizeof(u64)));
+    CHECKCUDAERR(cudaMalloc(&d_digests, digests_count * HASH_SIZE_U64 * sizeof(u64)));
+    CHECKCUDAERR(cudaMalloc(&d_caps, caps_count * HASH_SIZE_U64 * sizeof(u64)));
+    CHECKCUDAERR(cudaMemcpy(d_leaves, leaves.data(), leaves.size() * sizeof(u64), cudaMemcpyHostToDevice));
+
+    // warmup
+    fill_digests_buf_linear_gpu_with_gpu_ptr(
+        d_digests,
+        d_caps,
+        d_leaves,
+        digests_count,
+        caps_count,
+        leaves_count,
+        leaf_size,
+        cap_height,
+        hash_type,
+        0);
+    CHECKCUDAERR(cudaDeviceSynchronize());
+
+    float gpu_ms = 0.0f;
+    cudaEvent_t start_evt, stop_evt;
+    CHECKCUDAERR(cudaEventCreate(&start_evt));
+    CHECKCUDAERR(cudaEventCreate(&stop_evt));
+    for (int r = 0; r < runs; r++)
+    {
+        CHECKCUDAERR(cudaEventRecord(start_evt));
+        fill_digests_buf_linear_gpu_with_gpu_ptr(
+            d_digests,
+            d_caps,
+            d_leaves,
+            digests_count,
+            caps_count,
+            leaves_count,
+            leaf_size,
+            cap_height,
+            hash_type,
+            0);
+        CHECKCUDAERR(cudaEventRecord(stop_evt));
+        CHECKCUDAERR(cudaEventSynchronize(stop_evt));
+        float iter_ms = 0.0f;
+        CHECKCUDAERR(cudaEventElapsedTime(&iter_ms, start_evt, stop_evt));
+        gpu_ms += iter_ms;
+    }
+    gpu_ms /= runs;
+
+    printf("Poseidon Merkle (leaves=%lu, leaf_size=%lu, cap_h=%lu) CPU %.3f ms | GPU %.3f ms | speedup %.2fx%s\\n",
+           leaves_count, leaf_size, cap_height, cpu_ms, gpu_ms, cpu_ms / gpu_ms,
+           have_baseline ? " (CPU baseline)" : "");
+
+    CHECKCUDAERR(cudaEventDestroy(start_evt));
+    CHECKCUDAERR(cudaEventDestroy(stop_evt));
+    CHECKCUDAERR(cudaFree(d_leaves));
+    CHECKCUDAERR(cudaFree(d_digests));
+    CHECKCUDAERR(cudaFree(d_caps));
+}
 #endif
 
 TEST(LIBCUDA, keccak_test)
@@ -197,6 +341,35 @@ TEST(LIBCUDA, keccak_test)
         }
     }
 }
+
+#ifdef USE_CUDA
+TEST(LIBCUDA, poseidon_merkle_bench)
+{
+    const u64 leaf_size = 135;
+    const u64 cap_height = 2;
+    const int runs = 5;
+    const u64 sizes[] = {8192, 16384, 32768};
+    const char *baseline_path = std::getenv("CPU_BASELINE_FILE");
+    if (baseline_path == nullptr)
+    {
+        baseline_path = "/Users/fujie/coding/cysic/plonky/okx_fork/plonky2-fork/plonky2/bench_baselines/merkle_cpu_mean.txt";
+    }
+    auto cpu_baseline = load_cpu_baseline(baseline_path);
+    if (!cpu_baseline.empty())
+    {
+        printf("Using CPU baseline file: %s\n", baseline_path);
+    }
+    else
+    {
+        printf("CPU baseline file not found or empty: %s (falling back to CPU timing)\n", baseline_path);
+    }
+
+    for (u64 leaves_count : sizes)
+    {
+        bench_poseidon_merkle_cuda_vs_cpu(leaves_count, leaf_size, cap_height, runs, cpu_baseline);
+    }
+}
+#endif
 
 TEST(LIBCUDA, monolith_test1)
 {
